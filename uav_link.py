@@ -21,7 +21,7 @@ INAV_MODES = {
 def find_serial_port(preferred: Optional[str]) -> Optional[str]:
     if preferred:
         return preferred
-    candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+    candidates = sorted(glob.glob("/dev/ttyACM1") + glob.glob("/dev/ttyUSB*"))
     return candidates[0] if candidates else None
 
 def try_connect(device: str, bauds=(115200, 57600)):
