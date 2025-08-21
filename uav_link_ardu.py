@@ -8,11 +8,9 @@ from typing import Optional
 
 from pymavlink import mavutil
 
-# ---------- Helpers ----------
 def find_serial_port(preferred: Optional[str]) -> Optional[str]:
     if preferred:
         return preferred
-    # Typical USB CDC/FTDI device names
     candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
     return candidates[0] if candidates else None
 
@@ -29,16 +27,13 @@ def try_connect(device: str, bauds=(921600, 576000, 230400, 115200, 57600)):
         except Exception as e:
             last_exc = e
             try:
-                # Close half-open file descriptors between attempts
                 m.close()
             except Exception:
                 pass
     raise RuntimeError(f"Failed to connect to {device} at common baud rates. Last error: {last_exc}")
 
 def is_mavlink2(master: mavutil.mavfile) -> bool:
-    # Heuristic: if link is speaking MAVLink2, master.mav.DIALECT.version==2 or flag on messages
-    # pymavlink exposes supported versions via 'master.mav.WIRE_PROTOCOL' but safest is to try.
-    return True  # MESSAGE_INTERVAL works on most modern FCs; we still fallback on failure.
+    return True 
 
 def request_message_intervals(master: mavutil.mavfile, hz_map: dict):
     """
@@ -55,8 +50,8 @@ def request_message_intervals(master: mavutil.mavfile, hz_map: dict):
                     master.target_component,
                     mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                     0,
-                    msg_id,          # param1: message ID
-                    interval_us,     # param2: interval in microseconds; -1 to stop
+                    msg_id,          
+                    interval_us,     
                     0, 0, 0, 0, 0
                 )
             print("[stream] Set MESSAGE_INTERVALs successfully (MAVLink 2).")
@@ -64,21 +59,20 @@ def request_message_intervals(master: mavutil.mavfile, hz_map: dict):
         except Exception as e:
             print(f"[stream] MESSAGE_INTERVAL failed ({e}); falling back to REQUEST_DATA_STREAM…")
 
-    # Fallback: REQUEST_DATA_STREAM (MAV 1.x style)
+    
     try:
         master.mav.request_data_stream_send(
             master.target_system,
             master.target_component,
             mavutil.mavlink.MAV_DATA_STREAM_ALL,
-            10,  # 10 Hz aggregate
-            1    # start
+            10,  
+            1    
         )
         print("[stream] Requested MAV_DATA_STREAM_ALL @ 10 Hz (fallback).")
     except Exception as e:
         print(f"[stream] REQUEST_DATA_STREAM failed: {e}")
 
 def send_gcs_heartbeat(master: mavutil.mavfile):
-    # Identify as a GCS
     master.mav.heartbeat_send(
         mavutil.mavlink.MAV_TYPE_GCS,
         mavutil.mavlink.MAV_AUTOPILOT_INVALID,
@@ -86,7 +80,6 @@ def send_gcs_heartbeat(master: mavutil.mavfile):
     )
 
 def set_mode(master: mavutil.mavfile, mode_str: str):
-    # Example: 'GUIDED', 'LOITER', 'AUTO'. Make sure FC supports it.
     master.set_mode(mode_str)
     print(f"[mode] Requested mode: {mode_str}")
 
@@ -97,10 +90,9 @@ def arm_disarm(master: mavutil.mavfile, arm: bool):
 def fmt_none(x):
     return "—" if x is None else x
 
-# ---------- Main loop ----------
 def main():
     ap = argparse.ArgumentParser(description="Pi4 ↔ Flight Controller (USB) MAVLink link using pymavlink")
-    ap.add_argument("--port", help="Serial device (e.g. /dev/ttyACM0). Auto-detects if omitted.")
+    ap.add_argument("--port", help="Serial device (e.g. /dev/ttyACM1). Auto-detects if omitted.")
     ap.add_argument("--baud", type=int, help="Baud rate. If omitted, try common speeds.")
     ap.add_argument("--print-every", type=float, default=1.0, help="Status print period (s).")
     ap.add_argument("--emit-heartbeat", action="store_true", help="Send GCS heartbeat @1 Hz.")
@@ -122,9 +114,7 @@ def main():
     else:
         master, baud_used = try_connect(device)
 
-    # Configure stream/message intervals
     hz = {
-        # name: Hz
         "HEARTBEAT": 1,
         "SYS_STATUS": 1,
         "BATTERY_STATUS": 1,
@@ -136,7 +126,6 @@ def main():
     }
     request_message_intervals(master, hz)
 
-    # Optional (DANGEROUS): change mode / arm. Left commented by default.
     if args.set_mode:
         try:
             set_mode(master, args.set_mode)
@@ -159,15 +148,12 @@ def main():
         while True:
             now = time.time()
 
-            # Optional: send our GCS heartbeat
             if args.emit_heartbeat and (now - last_hb) >= 1.0:
                 send_gcs_heartbeat(master)
                 last_hb = now
 
-            # Non-blocking read; process any incoming message to keep link fresh
             msg = master.recv_msg()
 
-            # Periodic status line
             if (now - last_print) >= args.print_every:
                 last_print = now
 
@@ -177,7 +163,6 @@ def main():
                 bat = master.messages.get("BATTERY_STATUS") or master.messages.get("SYS_STATUS")
                 gpos = master.messages.get("GLOBAL_POSITION_INT")
 
-                # Parse fields safely
                 if gps:
                     lat = gps.lat / 1e7
                     lon = gps.lon / 1e7
@@ -203,7 +188,6 @@ def main():
                 alt_rel = getattr(vfr, "alt", None) if vfr else None
 
                 if bat and hasattr(bat, "voltages") and bat.voltages:
-                    # BATTERY_STATUS.voltages is array in mV; pick the first non-65535
                     vs = [v for v in bat.voltages if v not in (None, 0, 65535)]
                     voltage = (sum(vs) / len(vs)) / 1000.0 if vs else None
                 else:
@@ -224,14 +208,12 @@ def main():
                     f"V {fmt_none(round(voltage,2) if voltage is not None else None)}"
                 )
 
-            # Brief nap to keep CPU use reasonable
             time.sleep(0.01)
 
     except KeyboardInterrupt:
         print("\n[exit] Ctrl-C received. Cleaning up…")
     finally:
         try:
-            # If we armed in this session, disarm on exit
             if args.arm:
                 arm_disarm(master, False)
         except Exception:
