@@ -1,3 +1,8 @@
+ARDUPILOT_MODES = [
+    "STABILIZE", "ACRO", "ALT_HOLD", "AUTO", "GUIDED", "LOITER", "RTL", "CIRCLE", "LAND",
+    "DRIFT", "SPORT", "FLIP", "AUTOTUNE", "POSHOLD", "BRAKE", "THROW", "AVOID_ADSB", "GUIDED_NOGPS",
+    "SMART_RTL", "FLOWHOLD", "FOLLOW", "ZIGZAG", "SYSTEMID", "AUTOROTATE", "AUTO_RTL"
+]
 #!/usr/bin/env python3
 import argparse
 import glob
@@ -260,6 +265,8 @@ def main():
                 stop_event.set()
             elif c == 'help':
                 print('Commands: mode [MODE], heartbeat, status, exit, help')
+                print('Valid ArduPilot modes:')
+                print(', '.join(ARDUPILOT_MODES))
             elif c == 'mode' and len(parts) > 1:
                 try:
                     set_mode(master, parts[1])
