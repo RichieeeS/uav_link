@@ -11,7 +11,7 @@ for m in required:
         missing.append(m)
 if missing:
     print(f"Installing missing modules: {', '.join(missing)}")
-    subprocess.check_call([sys.executable, '-m', 'pip3', 'install', '--break-system-packages'] + missing)
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--break-system-packages'] + missing)
 #!/usr/bin/env python3
 import argparse
 import glob
