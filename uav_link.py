@@ -1,3 +1,17 @@
+import sys
+import subprocess
+required = [
+    'prompt_toolkit', 'pymavlink', 'flask', 'numpy', 'opencv-python', 'ultralytics', 'onnx', 'onnxruntime', 'onnxslim'
+]
+missing = []
+for m in required:
+    try:
+        __import__(m.split('-')[0])
+    except ImportError:
+        missing.append(m)
+if missing:
+    print(f"Installing missing modules: {', '.join(missing)}")
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--break-system-packages'] + missing)
 #!/usr/bin/env python3
 import argparse
 import glob
@@ -128,6 +142,27 @@ def fmt_none(x):
     return "—" if x is None else x
 
 def main():
+    import subprocess
+    import signal
+    import re
+    # Check for other processes using the camera (e.g., /dev/video0)
+    try:
+        lsof_out = subprocess.check_output(['lsof', '/dev/video0'], stderr=subprocess.DEVNULL).decode()
+        pids = set()
+        for line in lsof_out.splitlines()[1:]:
+            m = re.match(r'\S+\s+(\d+)', line)
+            if m:
+                pids.add(int(m.group(1)))
+        for pid in pids:
+            if pid != os.getpid():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        if pids:
+            print(f"Killed processes using /dev/video0: {', '.join(map(str, pids))}")
+    except Exception:
+        pass
     log_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_filename = f'telemetry_{log_id}.log'
     log_file = open(log_filename, 'a')
