@@ -3,19 +3,40 @@ import argparse
 import glob
 import sys
 import time
+import select
+from prompt_toolkit import prompt
+from prompt_toolkit.patch_stdout import patch_stdout
 from datetime import datetime
 from typing import Optional
 
 from pymavlink import mavutil
 
-INAV_MODES = {
-    "MANUAL": 0,
-    "ANGLE": 1,
-    "HORIZON": 2,
-    "POSHOLD": 5,   
-    "RTH": 6,       
-    "WP": 7,        
-    "ACRO": 8,
+ARDUPILOT_MODES = {
+    "STABILIZE": 0,
+    "ACRO": 1,
+    "ALT_HOLD": 2,
+    "AUTO": 3,
+    "GUIDED": 4,
+    "LOITER": 5,
+    "RTL": 6,
+    "CIRCLE": 7,
+    "LAND": 9,
+    "DRIFT": 11,
+    "SPORT": 13,
+    "FLIP": 14,
+    "AUTOTUNE": 15,
+    "POSHOLD": 16,
+    "BRAKE": 17,
+    "THROW": 18,
+    "AVOID_ADSB": 19,
+    "GUIDED_NOGPS": 20,
+    "SMART_RTL": 21,
+    "FLOWHOLD": 22,
+    "FOLLOW": 23,
+    "ZIGZAG": 24,
+    "SYSTEMID": 25,
+    "AUTOROTATE": 26,
+    "AUTO_RTL": 27
 }
 
 def find_serial_port(preferred: Optional[str]) -> Optional[str]:
@@ -43,22 +64,36 @@ def try_connect(device: str, bauds=(115200, 57600)):
     raise RuntimeError(f"Failed to connect to {device}. Last error: {last_exc}")
 
 def request_message_intervals(master: mavutil.mavfile, hz_map: dict):
+    if hasattr(master, 'mavlink') and hasattr(master.mavlink, 'get_msgId'):
+        try:
+            for msg_name, hz in hz_map.items():
+                msg_id = master.mavlink.get_msgId(msg_name)
+                interval_us = int(1_000_000 / hz) if hz > 0 else -1
+                master.mav.command_long_send(
+                    master.target_system,
+                    master.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    msg_id,
+                    interval_us,
+                    0, 0, 0, 0, 0
+                )
+            print("[stream] MESSAGE_INTERVAL requests sent.")
+            return
+        except Exception as e:
+            print(f"[stream] MESSAGE_INTERVAL failed ({e}); falling back to REQUEST_DATA_STREAM…")
+    # Fallback
     try:
-        for msg_name, hz in hz_map.items():
-            msg_id = master.mavlink.get_msgId(msg_name)
-            interval_us = int(1_000_000 / hz) if hz > 0 else -1
-            master.mav.command_long_send(
-                master.target_system,
-                master.target_component,
-                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                0,
-                msg_id,
-                interval_us,
-                0, 0, 0, 0, 0
-            )
-        print("[stream] MESSAGE_INTERVAL requests sent.")
+        master.mav.request_data_stream_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_DATA_STREAM_ALL,
+            10,
+            1
+        )
+        print("[stream] Requested MAV_DATA_STREAM_ALL @ 10 Hz (fallback).")
     except Exception as e:
-        print(f"[stream] Failed to set message intervals: {e}")
+        print(f"[stream] REQUEST_DATA_STREAM failed: {e}")
 
 def send_gcs_heartbeat(master: mavutil.mavfile):
     master.mav.heartbeat_send(
@@ -78,37 +113,31 @@ def arm_disarm(master: mavutil.mavfile, arm: bool):
     )
     print(f"[arm] Sent {'ARM' if arm else 'DISARM'} command")
 
-def set_mode_inav(master: mavutil.mavfile, mode_name: str):
-    if mode_name.upper() not in INAV_MODES:
-        print(f"[mode] Unknown mode '{mode_name}'. Valid: {list(INAV_MODES.keys())}")
+def set_mode_ardupilot(master: mavutil.mavfile, mode_name: str):
+    mode_name = mode_name.upper()
+    if mode_name not in ARDUPILOT_MODES:
+        print(f"[mode] Unknown mode '{mode_name}'. Valid: {list(ARDUPILOT_MODES.keys())}")
         return
-    custom_mode = INAV_MODES[mode_name.upper()]
-    base_mode = mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-    master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-        0,
-        base_mode,
-        custom_mode,
-        0, 0, 0, 0, 0
-    )
-    print(f"[mode] Requested iNav mode {mode_name} ({custom_mode})")
+    mode_id = ARDUPILOT_MODES[mode_name]
+    # Set mode using ArduPilot convention
+    master.set_mode(mode_id)
+    print(f"[mode] Requested ArduPilot mode {mode_name} ({mode_id})")
 
 def fmt_none(x):
     return "—" if x is None else x
 
 def main():
-    ap = argparse.ArgumentParser(description="Raspberry Pi ↔ iNav FC (USB) MAVLink link using pymavlink")
+    ap = argparse.ArgumentParser(description="Raspberry Pi ↔ ArduPilot FC (USB) MAVLink link using pymavlink")
     ap.add_argument("--port", help="Serial device (e.g. /dev/ttyACM0). Auto-detects if omitted.")
     ap.add_argument("--baud", type=int, help="Baud rate. If omitted, tries common speeds.")
     ap.add_argument("--print-every", type=float, default=1.0, help="Status print period (s).")
     ap.add_argument("--emit-heartbeat", action="store_true", help="Send GCS heartbeat @1 Hz.")
-    ap.add_argument("--set-mode", help=f"Set iNav flight mode on start. Options: {list(INAV_MODES.keys())}")
+    ap.add_argument("--set-mode", help=f"Set ArduPilot flight mode on start. Options: {list(ARDUPILOT_MODES.keys())}")
     ap.add_argument("--arm", action="store_true", help="Arm on start (dangerous!).")
     args = ap.parse_args()
 
     device = find_serial_port(args.port)
+
     if not device:
         print("No USB serial device found. Plug in FC or pass --port /dev/ttyACM0")
         sys.exit(1)
@@ -121,7 +150,6 @@ def main():
     else:
         master, baud_used = try_connect(device)
 
-    
     hz = {
         "HEARTBEAT": 1,
         "SYS_STATUS": 1,
@@ -129,76 +157,198 @@ def main():
         "GPS_RAW_INT": 5,
         "GLOBAL_POSITION_INT": 5,
         "ATTITUDE": 10,
-        "VFR_HUD": 2,
+        "VFR_HUD": 2
     }
     request_message_intervals(master, hz)
 
-    if args.set_mode:
-        set_mode_inav(master, args.set_mode)
-    if args.arm:
-        print("!!! WARNING: Arming motors on not a clear surface is dangerous. Remove obstacles first. !!!")
-        time.sleep(1.5)
-        arm_disarm(master, True)
 
+    if args.set_mode:
+        set_mode_ardupilot(master, args.set_mode)
+        if args.arm:
+            print("!!! WARNING: Arming motors on not a clear surface is dangerous. Remove obstacles first. !!!")
+            time.sleep(1.5)
+            arm_disarm(master, True)
+
+    print(f"[ok] Connected on {device} @ {baud_used}. Type 'help' for commands. Press Ctrl-C or type 'exit' to quit.")
     last_print = 0.0
     last_hb = 0.0
+    latest = {}
+    import threading
+    import queue
 
-    print(f"[ok] Connected on {device} @ {baud_used}. Press Ctrl-C to exit.")
+    stop_event = threading.Event()
+    input_queue = queue.Queue()
+
+
+    def telemetry_loop():
+        nonlocal last_print, last_hb, latest
+        while not stop_event.is_set():
+            try:
+                now = time.time()
+                if args.emit_heartbeat and (now - last_hb) >= 1.0:
+                    send_gcs_heartbeat(master)
+                    last_hb = now
+                msg = master.recv_msg()
+                if msg:
+                    latest[msg.get_type()] = msg
+                if (now - last_print) >= args.print_every:
+                    last_print = now
+                    gps = latest.get("GPS_RAW_INT")
+                    att = latest.get("ATTITUDE")
+                    vfr = latest.get("VFR_HUD")
+                    bat = latest.get("BATTERY_STATUS") or latest.get("SYS_STATUS")
+                    gpos = latest.get("GLOBAL_POSITION_INT")
+                    if gps:
+                        lat = gps.lat / 1e7
+                        lon = gps.lon / 1e7
+                        alt_msl = gps.alt / 1000.0
+                        sats = getattr(gps, "satellites_visible", None)
+                    elif gpos:
+                        lat = gpos.lat / 1e7
+                        lon = gpos.lon / 1e7
+                        alt_msl = gpos.alt / 1000.0
+                        sats = None
+                    else:
+                        lat = lon = alt_msl = sats = None
+                    roll = att.roll if att else None
+                    pitch = att.pitch if att else None
+                    yaw = att.yaw if att else None
+                    groundspeed = getattr(vfr, "groundspeed", None) if vfr else None
+                    throttle = getattr(vfr, "throttle", None) if vfr else None
+                    if bat and hasattr(bat, "voltages") and bat.voltages:
+                        vs = [v for v in bat.voltages if v not in (None, 0, 65535)]
+                        voltage = (sum(vs) / len(vs)) / 1000.0 if vs else None
+                    else:
+                        voltage = None
+                    base = datetime.now().strftime("%H:%M:%S")
+                    latest['status_str'] = (
+                        f"[{base}] "
+                        f"GPS {fmt_none(lat)}, {fmt_none(lon)} alt {fmt_none(round(alt_msl,1) if alt_msl else None)}m "
+                        f"(sats {fmt_none(sats)}) | "
+                        f"att r/p/y {fmt_none(round(roll,2) if roll else None)}/"
+                        f"{fmt_none(round(pitch,2) if pitch else None)}/"
+                        f"{fmt_none(round(yaw,2) if yaw else None)} | "
+                        f"gs {fmt_none(round(groundspeed,2) if groundspeed else None)} m/s thr {fmt_none(throttle)} | "
+                        f"V {fmt_none(round(voltage,2) if voltage else None)}"
+                    )
+                    print(latest['status_str'], flush=True)
+                time.sleep(0.01)
+            except TypeError as e:
+                if "NoneType" in str(e) and "item assignment" in str(e):
+                    continue
+                else:
+                    print(f"[telemetry_loop] Exception: {e}")
+                    continue
+
+    def input_loop():
+        try:
+            with patch_stdout():
+                while not stop_event.is_set():
+                    cmd = prompt('> ')
+                    input_queue.put(cmd.strip())
+        except EOFError:
+            stop_event.set()
+        except KeyboardInterrupt:
+            stop_event.set()
+
+    t1 = threading.Thread(target=telemetry_loop, daemon=True)
+    t2 = threading.Thread(target=input_loop, daemon=True)
+    t1.start()
+    t2.start()
+
     try:
-        while True:
-            now = time.time()
-
-            if args.emit_heartbeat and (now - last_hb) >= 1.0:
-                send_gcs_heartbeat(master)
-                last_hb = now
-
-            msg = master.recv_msg()
-
-            if (now - last_print) >= args.print_every:
-                last_print = now
-
-                gps = master.messages.get("GPS_RAW_INT")
-                att = master.messages.get("ATTITUDE")
-                vfr = master.messages.get("VFR_HUD")
-                bat = master.messages.get("BATTERY_STATUS") or master.messages.get("SYS_STATUS")
-
-                if gps:
-                    lat = gps.lat / 1e7
-                    lon = gps.lon / 1e7
-                    alt_msl = gps.alt / 1000.0
-                    sats = getattr(gps, "satellites_visible", None)
-                else:
-                    lat = lon = alt_msl = sats = None
-
-                roll = att.roll if att else None
-                pitch = att.pitch if att else None
-                yaw = att.yaw if att else None
-
-                groundspeed = getattr(vfr, "groundspeed", None) if vfr else None
-                throttle = getattr(vfr, "throttle", None) if vfr else None
-
-                if bat and hasattr(bat, "voltages") and bat.voltages:
-                    vs = [v for v in bat.voltages if v not in (None, 0, 65535)]
-                    voltage = (sum(vs) / len(vs)) / 1000.0 if vs else None
-                else:
-                    voltage = None
-
-                base = datetime.now().strftime("%H:%M:%S")
-                print(
-                    f"[{base}] "
-                    f"GPS {fmt_none(lat)}, {fmt_none(lon)} alt {fmt_none(round(alt_msl,1) if alt_msl else None)}m "
-                    f"(sats {fmt_none(sats)}) | "
-                    f"att r/p/y {fmt_none(round(roll,2) if roll else None)}/"
-                    f"{fmt_none(round(pitch,2) if pitch else None)}/"
-                    f"{fmt_none(round(yaw,2) if yaw else None)} | "
-                    f"gs {fmt_none(round(groundspeed,2) if groundspeed else None)} m/s thr {fmt_none(throttle)} | "
-                    f"V {fmt_none(round(voltage,2) if voltage else None)}"
-                )
-
-            time.sleep(0.01)
-
+        while not stop_event.is_set():
+            try:
+                cmd = input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if not cmd:
+                continue
+            parts = cmd.split()
+            if not parts:
+                continue
+            c = parts[0].lower()
+            if c == 'exit' or c == 'quit':
+                print('[exit] Exiting...')
+                stop_event.set()
+            elif c == 'help':
+                print('Commands: mode [MODE], heartbeat, status, exit, help')
+                print('Valid ArduPilot modes:')
+                print(', '.join(ARDUPILOT_MODES.keys()))
+            elif c == 'mode' and len(parts) > 1:
+                try:
+                    set_mode_ardupilot(master, parts[1])
+                except Exception as e:
+                    print(f'[mode] Failed: {e}')
+            elif c == 'heartbeat':
+                try:
+                    send_gcs_heartbeat(master)
+                    print('[heartbeat] Sent GCS heartbeat.')
+                except Exception as e:
+                    print(f'[heartbeat] Failed: {e}')
+            elif c == 'status':
+                print(latest.get('status_str', '[status] No telemetry yet.'))
+            else:
+                print('[error] Unknown command. Type help.')
+        stop_event.set()
     except KeyboardInterrupt:
         print("\n[exit] Ctrl-C received. Cleaning up…")
+        stop_event.set()
+    finally:
+        if args.arm:
+            try:
+                arm_disarm(master, False)
+            except Exception:
+                pass
+        try:
+            master.close()
+        except Exception:
+            pass
+        print("[exit] Link closed.")
+
+    t1 = threading.Thread(target=telemetry_loop, daemon=True)
+    t2 = threading.Thread(target=input_loop, daemon=True)
+    t1.start()
+    t2.start()
+
+    try:
+        while not stop_event.is_set():
+            try:
+                cmd = input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if not cmd:
+                continue
+            parts = cmd.split()
+            if not parts:
+                continue
+            c = parts[0].lower()
+            if c == 'exit' or c == 'quit':
+                print('[exit] Exiting...')
+                stop_event.set()
+            elif c == 'help':
+                print('Commands: mode [MODE], heartbeat, status, exit, help')
+                print('Valid ArduPilot modes:')
+                print(', '.join(ARDUPILOT_MODES.keys()))
+            elif c == 'mode' and len(parts) > 1:
+                try:
+                    set_mode_ardupilot(master, parts[1])
+                except Exception as e:
+                    print(f'[mode] Failed: {e}')
+            elif c == 'heartbeat':
+                try:
+                    send_gcs_heartbeat(master)
+                    print('[heartbeat] Sent GCS heartbeat.')
+                except Exception as e:
+                    print(f'[heartbeat] Failed: {e}')
+            elif c == 'status':
+                print(latest.get('status_str', '[status] No telemetry yet.'))
+            else:
+                print('[error] Unknown command. Type help.')
+        stop_event.set()
+    except KeyboardInterrupt:
+        print("\n[exit] Ctrl-C received. Cleaning up…")
+        stop_event.set()
     finally:
         if args.arm:
             try:
