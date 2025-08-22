@@ -163,62 +163,70 @@ def main():
     def telemetry_loop():
         nonlocal last_print, last_hb, latest
         while not stop_event.is_set():
-            now = time.time()
-            if args.emit_heartbeat and (now - last_hb) >= 1.0:
-                send_gcs_heartbeat(master)
-                last_hb = now
-            msg = master.recv_msg()
-            if msg:
-                latest[msg.get_type()] = msg
-            if (now - last_print) >= args.print_every:
-                last_print = now
-                # Save latest telemetry for status command
-                gps = latest.get("GPS_RAW_INT")
-                att = latest.get("ATTITUDE")
-                vfr = latest.get("VFR_HUD")
-                bat = latest.get("BATTERY_STATUS") or latest.get("SYS_STATUS")
-                gpos = latest.get("GLOBAL_POSITION_INT")
-                if gps:
-                    lat = gps.lat / 1e7
-                    lon = gps.lon / 1e7
-                    alt_msl = gps.alt / 1000.0
-                    hdop = getattr(gps, "eph", None)
-                    sats = getattr(gps, "satellites_visible", None)
-                elif gpos:
-                    lat = gpos.lat / 1e7
-                    lon = gpos.lon / 1e7
-                    alt_msl = gpos.alt / 1000.0
-                    hdop = None
-                    sats = None
+            try:
+                now = time.time()
+                if args.emit_heartbeat and (now - last_hb) >= 1.0:
+                    send_gcs_heartbeat(master)
+                    last_hb = now
+                msg = master.recv_msg()
+                if msg:
+                    latest[msg.get_type()] = msg
+                if (now - last_print) >= args.print_every:
+                    last_print = now
+                    # Save latest telemetry for status command
+                    gps = latest.get("GPS_RAW_INT")
+                    att = latest.get("ATTITUDE")
+                    vfr = latest.get("VFR_HUD")
+                    bat = latest.get("BATTERY_STATUS") or latest.get("SYS_STATUS")
+                    gpos = latest.get("GLOBAL_POSITION_INT")
+                    if gps:
+                        lat = gps.lat / 1e7
+                        lon = gps.lon / 1e7
+                        alt_msl = gps.alt / 1000.0
+                        hdop = getattr(gps, "eph", None)
+                        sats = getattr(gps, "satellites_visible", None)
+                    elif gpos:
+                        lat = gpos.lat / 1e7
+                        lon = gpos.lon / 1e7
+                        alt_msl = gpos.alt / 1000.0
+                        hdop = None
+                        sats = None
+                    else:
+                        lat = lon = alt_msl = hdop = sats = None
+                    roll = att.roll if att else None
+                    pitch = att.pitch if att else None
+                    yaw = att.yaw if att else None
+                    airspeed = getattr(vfr, "airspeed", None) if vfr else None
+                    groundspeed = getattr(vfr, "groundspeed", None) if vfr else None
+                    throttle = getattr(vfr, "throttle", None) if vfr else None
+                    alt_rel = getattr(vfr, "alt", None) if vfr else None
+                    if bat and hasattr(bat, "voltages") and bat.voltages:
+                        vs = [v for v in bat.voltages if v not in (None, 0, 65535)]
+                        voltage = (sum(vs) / len(vs)) / 1000.0 if vs else None
+                    else:
+                        voltage = getattr(latest.get("SYS_STATUS"), "voltage_battery", None)
+                        voltage = voltage / 1000.0 if voltage else None
+                    link = latest.get("HEARTBEAT")
+                    base = datetime.now().strftime("%H:%M:%S")
+                    latest['status_str'] = (
+                        f"[{base}] "
+                        f"HB sys:{master.target_system} comp:{master.target_component} | "
+                        f"GPS {fmt_none(lat):>8}, {fmt_none(lon):>9} alt {fmt_none(round(alt_msl,1) if alt_msl is not None else None)} m "
+                        f"(sats {fmt_none(sats)} hdop {fmt_none(hdop)}) | "
+                        f"att r/p/y {fmt_none(round(roll,2) if roll is not None else None)}/"
+                        f"{fmt_none(round(pitch,2) if pitch is not None else None)}/"
+                        f"{fmt_none(round(yaw,2) if yaw is not None else None)} | "
+                        f"gs {fmt_none(round(groundspeed,2) if groundspeed is not None else None)} m/s thr {fmt_none(throttle)} | "
+                        f"V {fmt_none(round(voltage,2) if voltage is not None else None)}"
+                    )
+                time.sleep(0.01)
+            except TypeError as e:
+                if "NoneType" in str(e) and "item assignment" in str(e):
+                    # Suppress pymavlink NoneType error
+                    continue
                 else:
-                    lat = lon = alt_msl = hdop = sats = None
-                roll = att.roll if att else None
-                pitch = att.pitch if att else None
-                yaw = att.yaw if att else None
-                airspeed = getattr(vfr, "airspeed", None) if vfr else None
-                groundspeed = getattr(vfr, "groundspeed", None) if vfr else None
-                throttle = getattr(vfr, "throttle", None) if vfr else None
-                alt_rel = getattr(vfr, "alt", None) if vfr else None
-                if bat and hasattr(bat, "voltages") and bat.voltages:
-                    vs = [v for v in bat.voltages if v not in (None, 0, 65535)]
-                    voltage = (sum(vs) / len(vs)) / 1000.0 if vs else None
-                else:
-                    voltage = getattr(latest.get("SYS_STATUS"), "voltage_battery", None)
-                    voltage = voltage / 1000.0 if voltage else None
-                link = latest.get("HEARTBEAT")
-                base = datetime.now().strftime("%H:%M:%S")
-                latest['status_str'] = (
-                    f"[{base}] "
-                    f"HB sys:{master.target_system} comp:{master.target_component} | "
-                    f"GPS {fmt_none(lat):>8}, {fmt_none(lon):>9} alt {fmt_none(round(alt_msl,1) if alt_msl is not None else None)} m "
-                    f"(sats {fmt_none(sats)} hdop {fmt_none(hdop)}) | "
-                    f"att r/p/y {fmt_none(round(roll,2) if roll is not None else None)}/"
-                    f"{fmt_none(round(pitch,2) if pitch is not None else None)}/"
-                    f"{fmt_none(round(yaw,2) if yaw is not None else None)} | "
-                    f"gs {fmt_none(round(groundspeed,2) if groundspeed is not None else None)} m/s thr {fmt_none(throttle)} | "
-                    f"V {fmt_none(round(voltage,2) if voltage is not None else None)}"
-                )
-            time.sleep(0.01)
+                    print(f"[telemetry_loop] Exception: {e}")
+                    continue
 
     def input_loop():
         try:
