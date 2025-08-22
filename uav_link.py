@@ -6,6 +6,7 @@ import time
 import select
 from prompt_toolkit import prompt
 from prompt_toolkit.patch_stdout import patch_stdout
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -13,7 +14,7 @@ from pymavlink import mavutil
 
 ARDUPILOT_MODES = {
     "STABILIZE": 0,
-    "ACRO": 1,
+    "ACRO": 1, 
     "ALT_HOLD": 2,
     "AUTO": 3,
     "GUIDED": 4,
@@ -42,7 +43,7 @@ ARDUPILOT_MODES = {
 def find_serial_port(preferred: Optional[str]) -> Optional[str]:
     if preferred:
         return preferred
-    candidates = sorted(glob.glob("/dev/ttyACM1") + glob.glob("/dev/ttyUSB*"))
+    candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
     return candidates[0] if candidates else None
 
 def try_connect(device: str, bauds=(115200, 57600)):
@@ -127,6 +128,14 @@ def fmt_none(x):
     return "—" if x is None else x
 
 def main():
+    log_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = f'telemetry_{log_id}.log'
+    log_file = open(log_filename, 'a')
+    print(f"[log] Telemetry will be saved to {log_filename}")
+
+    import subprocess
+    import signal
+    yolo_proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(__file__), 'yolo_stream.py')])
     ap = argparse.ArgumentParser(description="Raspberry Pi ↔ ArduPilot FC (USB) MAVLink link using pymavlink")
     ap.add_argument("--port", help="Serial device (e.g. /dev/ttyACM0). Auto-detects if omitted.")
     ap.add_argument("--baud", type=int, help="Baud rate. If omitted, tries common speeds.")
@@ -232,6 +241,11 @@ def main():
                         f"V {fmt_none(round(voltage,2) if voltage else None)}"
                     )
                     print(latest['status_str'], flush=True)
+                    try:
+                        log_file.write(latest['status_str'] + '\n')
+                        log_file.flush()
+                    except Exception:
+                        pass
                 time.sleep(0.01)
             except TypeError as e:
                 if "NoneType" in str(e) and "item assignment" in str(e):
@@ -264,35 +278,60 @@ def main():
                 continue
             if not cmd:
                 continue
+            try:
+                log_file.write(f"[command] {cmd}\n")
+                log_file.flush()
+            except Exception:
+                pass
             parts = cmd.split()
             if not parts:
                 continue
             c = parts[0].lower()
+            output = None
             if c == 'exit' or c == 'quit':
-                print('[exit] Exiting...')
+                output = '[exit] Exiting...'
+                print(output)
                 stop_event.set()
             elif c == 'help':
+                output = 'Commands: mode [MODE], heartbeat, status, exit, help\nValid ArduPilot modes:\n' + ', '.join(ARDUPILOT_MODES.keys())
                 print('Commands: mode [MODE], heartbeat, status, exit, help')
                 print('Valid ArduPilot modes:')
                 print(', '.join(ARDUPILOT_MODES.keys()))
             elif c == 'mode' and len(parts) > 1:
                 try:
                     set_mode_ardupilot(master, parts[1])
+                    output = f"[mode] Set mode to {parts[1]}"
                 except Exception as e:
-                    print(f'[mode] Failed: {e}')
+                    output = f'[mode] Failed: {e}'
+                    print(output)
             elif c == 'heartbeat':
                 try:
                     send_gcs_heartbeat(master)
-                    print('[heartbeat] Sent GCS heartbeat.')
+                    output = '[heartbeat] Sent GCS heartbeat.'
+                    print(output)
                 except Exception as e:
-                    print(f'[heartbeat] Failed: {e}')
+                    output = f'[heartbeat] Failed: {e}'
+                    print(output)
             elif c == 'status':
-                print(latest.get('status_str', '[status] No telemetry yet.'))
+                output = latest.get('status_str', '[status] No telemetry yet.')
+                print(output)
             else:
-                print('[error] Unknown command. Type help.')
+                output = '[error] Unknown command. Type help.'
+                print(output)
+            if output:
+                try:
+                    log_file.write(f"[output] {output}\n")
+                    log_file.flush()
+                except Exception:
+                    pass
         stop_event.set()
     except KeyboardInterrupt:
         print("\n[exit] Ctrl-C received. Cleaning up…")
+        try:
+            log_file.write("[output] KeyboardInterrupt: Exiting...\n")
+            log_file.flush()
+        except Exception:
+            pass
         stop_event.set()
     finally:
         if args.arm:
@@ -302,6 +341,15 @@ def main():
                 pass
         try:
             master.close()
+        except Exception:
+            pass
+        try:
+            log_file.close()
+        except Exception:
+            pass
+        try:
+            yolo_proc.terminate()
+            yolo_proc.wait(timeout=5)
         except Exception:
             pass
         print("[exit] Link closed.")
