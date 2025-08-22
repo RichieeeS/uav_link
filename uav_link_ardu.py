@@ -3,6 +3,7 @@ import argparse
 import glob
 import sys
 import time
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -100,9 +101,18 @@ def main():
     ap.add_argument("--arm", action="store_true", help="Arm on start (DANGEROUS).")
     args = ap.parse_args()
 
+
+    # Start YOLO stream HTTP server in background
+    import subprocess
+    yolo_proc = subprocess.Popen([
+        sys.executable, os.path.join(os.path.dirname(__file__), 'yolo_stream.py')
+    ])
+    print("[yolo] Started yolo_stream.py HTTP server in background.")
+
     device = find_serial_port(args.port)
     if not device:
         print("No USB serial device found. Plug in FC or pass --port /dev/ttyACM0")
+        yolo_proc.terminate()
         sys.exit(1)
 
     if args.baud:
@@ -140,29 +150,34 @@ def main():
         except Exception as e:
             print(f"[arm] Failed: {e}")
 
+
+    print(f"[ok] Connected on {device} @ {baud_used}. Type 'help' for commands. Press Ctrl-C or type 'exit' to quit.")
     last_print = 0.0
     last_hb = 0.0
+    latest = {}
+    import threading
+    import queue
+    stop_event = threading.Event()
+    input_queue = queue.Queue()
 
-    print(f"[ok] Connected on {device} @ {baud_used}. Press Ctrl-C to exit.")
-    try:
-        while True:
+    def telemetry_loop():
+        nonlocal last_print, last_hb, latest
+        while not stop_event.is_set():
             now = time.time()
-
             if args.emit_heartbeat and (now - last_hb) >= 1.0:
                 send_gcs_heartbeat(master)
                 last_hb = now
-
             msg = master.recv_msg()
-
+            if msg:
+                latest[msg.get_type()] = msg
             if (now - last_print) >= args.print_every:
                 last_print = now
-
-                gps = master.messages.get("GPS_RAW_INT")
-                att = master.messages.get("ATTITUDE")
-                vfr = master.messages.get("VFR_HUD")
-                bat = master.messages.get("BATTERY_STATUS") or master.messages.get("SYS_STATUS")
-                gpos = master.messages.get("GLOBAL_POSITION_INT")
-
+                # Save latest telemetry for status command
+                gps = latest.get("GPS_RAW_INT")
+                att = latest.get("ATTITUDE")
+                vfr = latest.get("VFR_HUD")
+                bat = latest.get("BATTERY_STATUS") or latest.get("SYS_STATUS")
+                gpos = latest.get("GLOBAL_POSITION_INT")
                 if gps:
                     lat = gps.lat / 1e7
                     lon = gps.lon / 1e7
@@ -177,26 +192,22 @@ def main():
                     sats = None
                 else:
                     lat = lon = alt_msl = hdop = sats = None
-
                 roll = att.roll if att else None
                 pitch = att.pitch if att else None
                 yaw = att.yaw if att else None
-
                 airspeed = getattr(vfr, "airspeed", None) if vfr else None
                 groundspeed = getattr(vfr, "groundspeed", None) if vfr else None
                 throttle = getattr(vfr, "throttle", None) if vfr else None
                 alt_rel = getattr(vfr, "alt", None) if vfr else None
-
                 if bat and hasattr(bat, "voltages") and bat.voltages:
                     vs = [v for v in bat.voltages if v not in (None, 0, 65535)]
                     voltage = (sum(vs) / len(vs)) / 1000.0 if vs else None
                 else:
-                    voltage = getattr(master.messages.get("SYS_STATUS"), "voltage_battery", None)
+                    voltage = getattr(latest.get("SYS_STATUS"), "voltage_battery", None)
                     voltage = voltage / 1000.0 if voltage else None
-
-                link = master.messages.get("HEARTBEAT")
+                link = latest.get("HEARTBEAT")
                 base = datetime.now().strftime("%H:%M:%S")
-                print(
+                latest['status_str'] = (
                     f"[{base}] "
                     f"HB sys:{master.target_system} comp:{master.target_component} | "
                     f"GPS {fmt_none(lat):>8}, {fmt_none(lon):>9} alt {fmt_none(round(alt_msl,1) if alt_msl is not None else None)} m "
@@ -207,11 +218,59 @@ def main():
                     f"gs {fmt_none(round(groundspeed,2) if groundspeed is not None else None)} m/s thr {fmt_none(throttle)} | "
                     f"V {fmt_none(round(voltage,2) if voltage is not None else None)}"
                 )
-
             time.sleep(0.01)
 
+    def input_loop():
+        try:
+            while not stop_event.is_set():
+                cmd = input('> ').strip()
+                input_queue.put(cmd)
+        except EOFError:
+            stop_event.set()
+        except KeyboardInterrupt:
+            stop_event.set()
+
+    t1 = threading.Thread(target=telemetry_loop, daemon=True)
+    t2 = threading.Thread(target=input_loop, daemon=True)
+    t1.start()
+    t2.start()
+
+    try:
+        while not stop_event.is_set():
+            try:
+                cmd = input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if not cmd:
+                continue
+            parts = cmd.split()
+            if not parts:
+                continue
+            c = parts[0].lower()
+            if c == 'exit' or c == 'quit':
+                print('[exit] Exiting...')
+                stop_event.set()
+            elif c == 'help':
+                print('Commands: mode [MODE], heartbeat, status, exit, help')
+            elif c == 'mode' and len(parts) > 1:
+                try:
+                    set_mode(master, parts[1])
+                except Exception as e:
+                    print(f'[mode] Failed: {e}')
+            elif c == 'heartbeat':
+                try:
+                    send_gcs_heartbeat(master)
+                    print('[heartbeat] Sent GCS heartbeat.')
+                except Exception as e:
+                    print(f'[heartbeat] Failed: {e}')
+            elif c == 'status':
+                print(latest.get('status_str', '[status] No telemetry yet.'))
+            else:
+                print('[error] Unknown command. Type help.')
+        stop_event.set()
     except KeyboardInterrupt:
         print("\n[exit] Ctrl-C received. Cleaning up…")
+        stop_event.set()
     finally:
         try:
             if args.arm:
@@ -220,6 +279,11 @@ def main():
             pass
         try:
             master.close()
+        except Exception:
+            pass
+        try:
+            yolo_proc.terminate()
+            print("[yolo] yolo_stream.py HTTP server terminated.")
         except Exception:
             pass
         print("[exit] Link closed.")
