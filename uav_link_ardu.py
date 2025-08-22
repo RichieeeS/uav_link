@@ -1,227 +1,228 @@
-def goto_gps(master, lat, lon, alt):
-    # Convert to required MAVLink format (degrees * 1e7, meters)
-    lat_int = int(float(lat) * 1e7)
-    lon_int = int(float(lon) * 1e7)
-    alt_m = float(alt)
-    master.mav.set_position_target_global_int_send(
-        int(time.time()*1e3), # time_boot_ms
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b0000111111111000, # type_mask: ignore velocity/accel/yaw
-        lat_int, lon_int, alt_m,
-        0, 0, 0, # vx, vy, vz
-        0, 0, 0, # afx, afy, afz
-        0, 0 # yaw, yaw_rate
-    )
-    print(f"[goto] Commanded to fly to lat={lat}, lon={lon}, alt={alt}")
-def set_mode(master, mode_name):
-    mode_id = master.mode_mapping().get(mode_name.upper())
-    if mode_id is None:
-        print(f"[mode] Unknown mode: {mode_name}")
-        return False
-    master.set_mode(mode_id)
-    print(f"[mode] Set mode to {mode_name}")
-    return True
-
-def arm_vehicle(master):
-    master.arducopter_arm()
-    print("[arm] Sent arm command")
-
-def disarm_vehicle(master):
-    master.arducopter_disarm()
-    print("[arm] Sent disarm command")
 #!/usr/bin/env python3
-import argparse, sys, time, threading, csv, os
+import argparse
+import glob
+import sys
+import time
 from datetime import datetime
-import numpy as np
+from typing import Optional
+
 from pymavlink import mavutil
 
-
-from picamera2 import Picamera2
-import onnxruntime as ort
-from yolo_nano_stream import letterbox, parse_predictions, COCO, IMG_SIZE
-
-
-def find_serial_port(preferred=None):
-    import glob
+def find_serial_port(preferred: Optional[str]) -> Optional[str]:
     if preferred:
         return preferred
     candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
     return candidates[0] if candidates else None
 
-def try_connect(device, bauds=(921600, 576000, 230400, 115200, 57600)):
+def try_connect(device: str, bauds=(921600, 576000, 230400, 115200, 57600)):
+    last_exc = None
     for baud in bauds:
         try:
             print(f"[connect] Trying {device} @ {baud} …")
             m = mavutil.mavlink_connection(device, baud=baud, autoreconnect=True, source_system=255)
+            print("[connect] Waiting for heartbeat (10s timeout)…")
             m.wait_heartbeat(timeout=10)
             print(f"[connect] Heartbeat from sys:{m.target_system} comp:{m.target_component} @ {baud}")
-            return m
-        except Exception:
-            try: m.close()
-            except: pass
-    raise RuntimeError("Failed to connect to FC")
+            return m, baud
+        except Exception as e:
+            last_exc = e
+            try:
+                m.close()
+            except Exception:
+                pass
+    raise RuntimeError(f"Failed to connect to {device} at common baud rates. Last error: {last_exc}")
 
-def send_gcs_heartbeat(master):
+def is_mavlink2(master: mavutil.mavfile) -> bool:
+    return True 
+
+def request_message_intervals(master: mavutil.mavfile, hz_map: dict):
+    """
+    Prefer MAV_CMD_SET_MESSAGE_INTERVAL (MAVLink 2). Fall back to REQUEST_DATA_STREAM if it fails.
+    """
+    use_message_interval = is_mavlink2(master)
+    if use_message_interval:
+        try:
+            for msg_name, hz in hz_map.items():
+                msg_id = master.mavlink.get_msgId(msg_name)
+                interval_us = int(1_000_000 / hz) if hz > 0 else -1
+                master.mav.command_long_send(
+                    master.target_system,
+                    master.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    msg_id,          
+                    interval_us,     
+                    0, 0, 0, 0, 0
+                )
+            print("[stream] Set MESSAGE_INTERVALs successfully (MAVLink 2).")
+            return
+        except Exception as e:
+            print(f"[stream] MESSAGE_INTERVAL failed ({e}); falling back to REQUEST_DATA_STREAM…")
+
+    
+    try:
+        master.mav.request_data_stream_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_DATA_STREAM_ALL,
+            10,  
+            1    
+        )
+        print("[stream] Requested MAV_DATA_STREAM_ALL @ 10 Hz (fallback).")
+    except Exception as e:
+        print(f"[stream] REQUEST_DATA_STREAM failed: {e}")
+
+def send_gcs_heartbeat(master: mavutil.mavfile):
     master.mav.heartbeat_send(
         mavutil.mavlink.MAV_TYPE_GCS,
         mavutil.mavlink.MAV_AUTOPILOT_INVALID,
         0, 0, mavutil.mavlink.MAV_STATE_ACTIVE
     )
 
-def send_yolo_detection(master, det_id, label, conf, x1,y1,x2,y2, img_w, img_h, csv_writer=None):
-    cx = (x1 + x2) / 2 / img_w
-    cy = (y1 + y2) / 2 / img_h
-    w  = (x2 - x1) / img_w
-    h  = (y2 - y1) / img_h
-    master.mav.vision_detection_send(
-        det_id,
-        int(conf*100),
-        0,0,0,
-        label.encode("utf-8"),
-        int(cx*1000), int(cy*1000), int(w*1000), int(h*1000),
-        0
-    )
-    ts = datetime.now().isoformat()
-    print(f"[yolo→mav DET] {label} conf={conf:.2f} center=({cx:.2f},{cy:.2f}) size=({w:.2f},{h:.2f})")
-    if csv_writer:
-        csv_writer.writerow([ts, "DETECTION", det_id, label, conf, cx, cy, w, h])
+def set_mode(master: mavutil.mavfile, mode_str: str):
+    master.set_mode(mode_str)
+    print(f"[mode] Requested mode: {mode_str}")
 
-def send_vision_position(master, ts_usec, cx, cy, size, csv_writer=None):
-    x = (cx - 0.5) * 2.0
-    y = (cy - 0.5) * -2.0
-    z = max(0.1, 1.0 - size)
+def arm_disarm(master: mavutil.mavfile, arm: bool):
+    master.arducopter_arm() if arm else master.arducopter_disarm()
+    print(f"[arm] Requested {'ARM' if arm else 'DISARM'}")
 
-    roll = pitch = yaw = 0.0
-    master.mav.vision_position_estimate_send(
-        ts_usec,
-        x, y, z,
-        roll, pitch, yaw
-    )
-    ts = datetime.now().isoformat()
-    print(f"[yolo→mav POSE] x={x:.2f} y={y:.2f} z={z:.2f}")
-    if csv_writer:
-        csv_writer.writerow([ts, "POSE", "", "", "", x, y, z])
-
-
-def yolo_worker(master, model_path, width, height, csv_writer):
-    cam = Picamera2()
-    cam.configure(cam.create_preview_configuration(main={"size": (width, height), "format": "RGB888"}))
-    cam.start()
-
-    sess = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-    inp  = sess.get_inputs()[0].name
-    out  = sess.get_outputs()[0].name
-
-    det_id = 0
-    while True:
-        frame = cam.capture_array()
-        img, r, (dw, dh) = letterbox(frame, (IMG_SIZE, IMG_SIZE))
-        x = img.astype(np.float32) / 255.0
-        x = np.transpose(x, (2,0,1))[None, ...]
-        raw = sess.run([out], {inp: x})[0]
-        dets = parse_predictions(raw, frame.shape[:2], r, dw, dh)
-
-        if dets:
-            for x1,y1,x2,y2,cls,conf in dets:
-                label = COCO[cls]
-                send_yolo_detection(master, det_id, label, conf, x1,y1,x2,y2, frame.shape[1], frame.shape[0], csv_writer)
-                det_id += 1
-
-            x1,y1,x2,y2,cls,conf = dets[0]
-            cx = (x1+x2)/2/frame.shape[1]
-            cy = (y1+y2)/2/frame.shape[0]
-            size = ((x2-x1)/frame.shape[1] + (y2-y1)/frame.shape[0]) / 2
-            ts_usec = int(time.time()*1e6)
-            send_vision_position(master, ts_usec, cx, cy, size, csv_writer)
-
-        time.sleep(0.05)
-
+def fmt_none(x):
+    return "—" if x is None else x
 
 def main():
-    ap = argparse.ArgumentParser(description="YOLO camera → ArduPilot MAVLink bridge with logging")
-    ap.add_argument("-p", "--port", help="Serial device (/dev/ttyACM0). Auto-detects if omitted.")
-    ap.add_argument("-b", "--baud", type=int, default=115200, help="Baud rate (default: 115200)")
-    ap.add_argument("-m", "--model", default="/home/asd2/yolo_cam/yolo.onnx", help="YOLO ONNX model path")
-    ap.add_argument("-e", "--emit-heartbeat", action="store_true", help="Emit GCS heartbeat")
-    ap.add_argument("-l", "--log", default="yolo_detections.csv", help="CSV log file path")
-    ap.add_argument("-w", "--cam-width", type=int, default=320, help="Camera width (default: 320)")
-    ap.add_argument("-t", "--cam-height", type=int, default=240, help="Camera height (default: 240)")
-
-    ap.add_argument("-a", "--arm", action="store_true", help="Arm the vehicle on startup")
-    ap.add_argument("-d", "--disarm", action="store_true", help="Disarm the vehicle on startup")
-    ap.add_argument("-M", "--mode", type=str, help="Set flight mode (e.g., GUIDED, AUTO, LOITER)")
+    ap = argparse.ArgumentParser(description="Pi4 ↔ Flight Controller (USB) MAVLink link using pymavlink")
+    ap.add_argument("--port", help="Serial device (e.g. /dev/ttyACM1). Auto-detects if omitted.")
+    ap.add_argument("--baud", type=int, help="Baud rate. If omitted, try common speeds.")
+    ap.add_argument("--print-every", type=float, default=1.0, help="Status print period (s).")
+    ap.add_argument("--emit-heartbeat", action="store_true", help="Send GCS heartbeat @1 Hz.")
+    ap.add_argument("--set-mode", help="Set flight mode on start (e.g. GUIDED). USE WITH CARE.")
+    ap.add_argument("--arm", action="store_true", help="Arm on start (DANGEROUS).")
     args = ap.parse_args()
 
     device = find_serial_port(args.port)
     if not device:
-        print("No FC found."); sys.exit(1)
-    master = try_connect(device, bauds=(args.baud,))
+        print("No USB serial device found. Plug in FC or pass --port /dev/ttyACM0")
+        sys.exit(1)
 
-    log_exists = os.path.exists(args.log)
-    log_file = open(args.log, "a", newline="")
-    csv_writer = csv.writer(log_file)
-    if not log_exists:
-        csv_writer.writerow(["timestamp","type","id","label","confidence","x","y","z_or_w","h"])  
+    if args.baud:
+        print(f"[connect] Using explicit {device} @ {args.baud}")
+        master = mavutil.mavlink_connection(device, baud=args.baud, autoreconnect=True, source_system=255)
+        print("[connect] Waiting for heartbeat (10s timeout)…")
+        master.wait_heartbeat(timeout=10)
+        baud_used = args.baud
+    else:
+        master, baud_used = try_connect(device)
 
+    hz = {
+        "HEARTBEAT": 1,
+        "SYS_STATUS": 1,
+        "BATTERY_STATUS": 1,
+        "GPS_RAW_INT": 5,
+        "GLOBAL_POSITION_INT": 5,
+        "ATTITUDE": 10,
+        "VFR_HUD": 2,
+        "HOME_POSITION": 0.2,
+    }
+    request_message_intervals(master, hz)
 
-    
-    if args.mode:
-        set_mode(master, args.mode)
-        time.sleep(1)
+    if args.set_mode:
+        try:
+            set_mode(master, args.set_mode)
+        except Exception as e:
+            print(f"[mode] Failed: {e}")
+
     if args.arm:
-        arm_vehicle(master)
-        time.sleep(1)
-    if args.disarm:
-        disarm_vehicle(master)
-        time.sleep(1)
+        print("!!! WARNING: Arming motors on a bench is dangerous. Ensure props off and area is safe. !!!")
+        time.sleep(1.5)
+        try:
+            arm_disarm(master, True)
+        except Exception as e:
+            print(f"[arm] Failed: {e}")
 
-    threading.Thread(target=yolo_worker, args=(master, args.model, args.cam_width, args.cam_height, csv_writer), daemon=True).start()
+    last_print = 0.0
+    last_hb = 0.0
 
-    last_hb = 0
-    def mavlink_loop():
-        while True:
-            now = time.time()
-            if args.emit_heartbeat and (now - last_hb) >= 1.0:
-                send_gcs_heartbeat(master)
-                nonlocal last_hb
-                last_hb = now
-            msg = master.recv_match(blocking=False)
-            if msg and msg.get_type().startswith("OSD_"):
-                print(f"[osd] {msg}")
-            time.sleep(0.05)
-
-    t = threading.Thread(target=mavlink_loop, daemon=True)
-    t.start()
-
+    print(f"[ok] Connected on {device} @ {baud_used}. Press Ctrl-C to exit.")
     try:
         while True:
-            cmd = input("[cmd] > ").strip()
-            if cmd == "exit":
-                print("[exit] Exiting interactive mode.")
-                break
-            elif cmd == "arm":
-                arm_vehicle(master)
-            elif cmd == "disarm":
-                disarm_vehicle(master)
-            elif cmd.startswith("mode "):
-                mode_name = cmd.split(None, 1)[1]
-                set_mode(master, mode_name)
-            elif cmd.startswith("goto "):
-                parts = cmd.split()
-                if len(parts) == 4:
-                    goto_gps(master, parts[1], parts[2], parts[3])
+            now = time.time()
+
+            if args.emit_heartbeat and (now - last_hb) >= 1.0:
+                send_gcs_heartbeat(master)
+                last_hb = now
+
+            msg = master.recv_msg()
+
+            if (now - last_print) >= args.print_every:
+                last_print = now
+
+                gps = master.messages.get("GPS_RAW_INT")
+                att = master.messages.get("ATTITUDE")
+                vfr = master.messages.get("VFR_HUD")
+                bat = master.messages.get("BATTERY_STATUS") or master.messages.get("SYS_STATUS")
+                gpos = master.messages.get("GLOBAL_POSITION_INT")
+
+                if gps:
+                    lat = gps.lat / 1e7
+                    lon = gps.lon / 1e7
+                    alt_msl = gps.alt / 1000.0
+                    hdop = getattr(gps, "eph", None)
+                    sats = getattr(gps, "satellites_visible", None)
+                elif gpos:
+                    lat = gpos.lat / 1e7
+                    lon = gpos.lon / 1e7
+                    alt_msl = gpos.alt / 1000.0
+                    hdop = None
+                    sats = None
                 else:
-                    print("Usage: goto <lat> <lon> <alt>")
-            elif cmd == "help":
-                print("Commands: arm, disarm, mode <MODE>, goto <lat> <lon> <alt>, exit, help")
-            else:
-                print("Unknown command. Type 'help' for options.")
+                    lat = lon = alt_msl = hdop = sats = None
+
+                roll = att.roll if att else None
+                pitch = att.pitch if att else None
+                yaw = att.yaw if att else None
+
+                airspeed = getattr(vfr, "airspeed", None) if vfr else None
+                groundspeed = getattr(vfr, "groundspeed", None) if vfr else None
+                throttle = getattr(vfr, "throttle", None) if vfr else None
+                alt_rel = getattr(vfr, "alt", None) if vfr else None
+
+                if bat and hasattr(bat, "voltages") and bat.voltages:
+                    vs = [v for v in bat.voltages if v not in (None, 0, 65535)]
+                    voltage = (sum(vs) / len(vs)) / 1000.0 if vs else None
+                else:
+                    voltage = getattr(master.messages.get("SYS_STATUS"), "voltage_battery", None)
+                    voltage = voltage / 1000.0 if voltage else None
+
+                link = master.messages.get("HEARTBEAT")
+                base = datetime.now().strftime("%H:%M:%S")
+                print(
+                    f"[{base}] "
+                    f"HB sys:{master.target_system} comp:{master.target_component} | "
+                    f"GPS {fmt_none(lat):>8}, {fmt_none(lon):>9} alt {fmt_none(round(alt_msl,1) if alt_msl is not None else None)} m "
+                    f"(sats {fmt_none(sats)} hdop {fmt_none(hdop)}) | "
+                    f"att r/p/y {fmt_none(round(roll,2) if roll is not None else None)}/"
+                    f"{fmt_none(round(pitch,2) if pitch is not None else None)}/"
+                    f"{fmt_none(round(yaw,2) if yaw is not None else None)} | "
+                    f"gs {fmt_none(round(groundspeed,2) if groundspeed is not None else None)} m/s thr {fmt_none(throttle)} | "
+                    f"V {fmt_none(round(voltage,2) if voltage is not None else None)}"
+                )
+
+            time.sleep(0.01)
+
     except KeyboardInterrupt:
-        print("\n[exit] Ctrl-C")
+        print("\n[exit] Ctrl-C received. Cleaning up…")
     finally:
-        log_file.close()
+        try:
+            if args.arm:
+                arm_disarm(master, False)
+        except Exception:
+            pass
+        try:
+            master.close()
+        except Exception:
+            pass
+        print("[exit] Link closed.")
 
 if __name__ == "__main__":
     main()
